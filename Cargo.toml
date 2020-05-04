@@ -1,0 +1,10 @@
+[package]
+name = "rustpiboot"
+description = "Port of the raspberry pi usbboot code to rust"
+version = "0.1.0"
+authors = ["Mathias Koch <mk@blackbird.online>"]
+edition = "2018"
+
+[dependencies]
+libusb = "0.3.0"
+dd-lib = "0.2.1"
