@@ -1,9 +1,11 @@
 //! Boot raspberry pi devices into mass storage mode
 
 use core::time::Duration;
-use libusb::{request_type, Context, Device, Direction, Recipient, RequestType, DeviceHandle};
-use std::thread;
+use libusb::{
+    request_type, Context, Device, DeviceHandle, Direction, Error, Recipient, RequestType,
+};
 use std::convert::TryInto;
+use std::thread;
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -17,29 +19,80 @@ pub enum Kind {
     FailedOpenDevice,
     DeviceNotFound,
     WriteError,
+    ReadError,
+    UnknownMessage,
+    IoError,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum Command {
+    GetFileSize = 0,
+    ReadFile = 1,
+    Done = 2,
+}
+
+impl std::convert::TryFrom<u32> for Command {
+    type Error = RpiError;
+
+    fn try_from(orig: u32) -> Result<Self, Self::Error> {
+        Ok(match orig {
+            0 => Command::GetFileSize,
+            1 => Command::ReadFile,
+            2 => Command::Done,
+            _ => {
+                return Err(RpiError {
+                    kind: Kind::UnknownMessage,
+                })
+            }
+        })
+    }
 }
 
 const LIBUSB_MAX_TRANSFER: usize = 16 * 1024;
 
-fn get_device(usb_ctx: &Context, pid: u16) -> Result<Device, RpiError> {
+fn get_device<'a>(
+    usb_ctx: &'a Context,
+    options: &Options,
+    pid: u16,
+) -> Result<(Device<'a>, DeviceHandle<'a>), RpiError> {
     if let Ok(devices) = usb_ctx.devices() {
-        match devices.iter().find(|dev| {
+        match devices.iter().enumerate().find(|(i, dev)| {
             if let Ok(desc) = dev.device_descriptor() {
+                if options.verbose {
+                    println!(
+                        "Found device {:?} idVendor=0x{:x?} idProduct=0x{:0x?}",
+                        i + 1,
+                        desc.vendor_id(),
+                        desc.product_id()
+                    );
+                    println!("Bus: {:?}, Device: {:?}", dev.bus_number(), dev.address());
+                }
                 if desc.vendor_id() == pid {
                     let prod_id = desc.product_id();
                     if prod_id == 0x2763 || prod_id == 0x2764 || prod_id == 0x2711 {
+                        if options.verbose {
+                            print!("Found candidate Compute Module... ");
+                            println!("Device located successfully");
+                        }
                         return true;
                     }
                 }
             }
             false
         }) {
-            Some(device) => {
+            Some((_, device)) => {
                 thread::sleep(Duration::from_secs(1));
                 match device.open() {
-                    Ok(_) => Ok(device),
-                    Err(_e) => {
-                        println!("Failed to open the requested device");
+                    Ok(handle) => Ok((device, handle)),
+                    Err(Error::Access) => {
+                        println!("Permission to access USB device denied. Make sure you are a member of the plugdev group.");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        if options.verbose {
+                            println!("Failed to open the requested device - {:?}", e);
+                        }
                         Err(RpiError {
                             kind: Kind::FailedOpenDevice,
                         })
@@ -57,29 +110,49 @@ fn get_device(usb_ctx: &Context, pid: u16) -> Result<Device, RpiError> {
     }
 }
 
-fn ep_write(dev_handle: &DeviceHandle, endpoint: u8, buf: &[u8]) -> Result<usize, RpiError> {
+fn ep_write(dev_handle: &DeviceHandle, endpoint: u8, buf: &[u8], options: &Options) -> Result<usize, RpiError> {
     dev_handle
         .write_control(
-            request_type(Direction::In, RequestType::Vendor, Recipient::Device),
+            request_type(Direction::Out, RequestType::Vendor, Recipient::Device),
             0,
-            buf.len().try_into().unwrap(),
+            (buf.len() & 0xffff).try_into().unwrap(),
             (buf.len() >> 16).try_into().unwrap(),
-            buf,
+            &[],
             Duration::from_secs(1),
         )
-        .expect("Failed control transfer!");
+        .unwrap();
 
     let mut sent = 0;
-
     for chunk in buf.chunks(LIBUSB_MAX_TRANSFER) {
         sent += dev_handle
-            .write_bulk(endpoint, chunk, Duration::from_secs(5))
+            .write_bulk(endpoint, chunk, Duration::from_secs(1))
             .map_err(|_| RpiError {
                 kind: Kind::WriteError,
             })?;
     }
-
+    if options.verbose {
+        println!("write_bulk sent: {:?} bytes", sent);
+    }
     Ok(sent)
+}
+
+fn ep_read(dev_handle: &DeviceHandle, buf: &mut [u8]) -> Result<usize, RpiError> {
+    dev_handle
+        .read_control(
+            request_type(Direction::In, RequestType::Vendor, Recipient::Device),
+            0,
+            (buf.len() & 0xffff).try_into().unwrap(),
+            (buf.len() >> 16).try_into().unwrap(),
+            buf,
+            Duration::from_secs(1),
+        )
+        .map_err(|e| RpiError {
+            kind: match e {
+                Error::NoDevice => Kind::DeviceNotFound,
+                Error::Io => Kind::IoError,
+                _ => Kind::ReadError,
+            },
+        })
 }
 
 fn second_stage_boot(
@@ -87,8 +160,14 @@ fn second_stage_boot(
     options: &Options,
     out_ep: u8,
     boot_message: &[u8],
-) -> Result<(), RpiError> {
-    let size = ep_write(dev_handle, out_ep, boot_message)?;
+) -> Result<u32, RpiError> {
+    ep_write(dev_handle, out_ep, &boot_message[0..24], options)?;
+
+    if options.verbose {
+        println!("Writing {} bytes", boot_message.len());
+    }
+
+    let size = ep_write(dev_handle, out_ep, boot_message, options)?;
     if size != boot_message.len() {
         println!("Failed to write correct length, returned {}", size);
         return Err(RpiError {
@@ -96,14 +175,104 @@ fn second_stage_boot(
         });
     };
 
-    if options.verbose {
-        println!("Writing {} bytes", boot_message.len());
+    thread::sleep(Duration::from_secs(1));
+
+    let buf = &mut [0; 4];
+    let size = ep_read(dev_handle, buf)?;
+    let retcode = u32::from_le_bytes(*buf);
+    if size > 0 && retcode == 0 {
+        println!("Successful read {:?} bytes", size);
+    } else {
+        println!("Failed : 0x{:x?}", retcode);
     }
 
-    Ok(())
+    Ok(retcode)
 }
 
-fn file_server(dev_handle: &DeviceHandle) {}
+fn file_server(
+    dev_handle: &DeviceHandle,
+    out_ep: u8,
+    start_message: &[u8],
+    options: &Options
+) -> Result<(), RpiError> {
+    let message = &mut [0; 260];
+    loop {
+        if let Err(e) = ep_read(dev_handle, message) {
+            // Drop out if the device goes away
+            match e {
+                RpiError {
+                    kind: Kind::DeviceNotFound,
+                }
+                | RpiError {
+                    kind: Kind::IoError,
+                } => {
+                    break;
+                }
+                _ => {
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+            }
+        }
+        let command: Command = u32::from_le_bytes(message[0..4].try_into().unwrap())
+            .try_into()
+            .map_err(|e| {
+                println!("{:?}", &message[0..4]);
+                e
+            })?;
+        let nul_range_end = message[4..]
+            .iter()
+            .position(|&c| c == b'\0')
+            .unwrap_or_else(|| message[4..].len()); // default to length if no `\0` present
+
+        let fname = std::str::from_utf8(&message[4..nul_range_end + 4]).unwrap();
+        if options.verbose {
+            println!("Received message {:?}: {:?}", command, fname);
+        }
+
+        if fname.is_empty() {
+            ep_write(dev_handle, out_ep, &[], options)?;
+            break;
+        }
+
+        match command {
+            Command::GetFileSize => {
+                if fname == "start.elf" {
+                    dev_handle
+                        .write_control(
+                            request_type(Direction::Out, RequestType::Vendor, Recipient::Device),
+                            0,
+                            (start_message.len() & 0xffff).try_into().unwrap(),
+                            (start_message.len() >> 16).try_into().unwrap(),
+                            &[],
+                            Duration::from_secs(1),
+                        )
+                        .unwrap();
+                } else {
+                    ep_write(dev_handle, out_ep, &[], options)?;
+                    if options.verbose {
+                        println!("Cannot open file {:?}", fname);
+                    }
+                }
+            }
+            Command::ReadFile => {
+                println!("File read: {:?}", fname);
+                let size = ep_write(dev_handle, out_ep, start_message, options)?;
+                if size != start_message.len() {
+                    println!("Failed to write complete file to USB device");
+                    return Err(RpiError {
+                        kind: Kind::WriteError,
+                    });
+                }
+            }
+            Command::Done => {
+                break;
+            }
+        }
+    }
+    println!("Second stage boot server done");
+    Ok(())
+}
 
 pub struct Options {
     verbose: bool,
@@ -130,8 +299,8 @@ impl Default for Options {
 }
 
 pub fn boot(options: Options) -> Result<(), RpiError> {
-    println!("Attempting to boot device");
     let second_stage = include_bytes!("bootcode.bin");
+    let start = include_bytes!("start.elf");
 
     // let signed_boot = if options.signed {
     //   Some(include_bytes!("bootsig.bin"))
@@ -147,42 +316,52 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
 
         // Wait for a device to get plugged in
         loop {
-            match get_device(&usb_ctx, 0x0a5c) {
+            match get_device(&usb_ctx, &options, 0x0a5c) {
                 Err(_) => {
                     thread::sleep(Duration::from_micros(200));
                     continue;
                 }
-                Ok(device) => {
-                    let config = device.active_config_descriptor().unwrap();
+                Ok((device, mut handle)) => {
+                    let config = device
+                        .active_config_descriptor()
+                        .expect("Failed to read config descriptor");
                     let (interface, out_ep, in_ep) = if config.num_interfaces() == 1 {
                         (0, 1, 2)
                     } else {
                         (1, 3, 4)
                     };
 
-                    let mut handle = device.open().unwrap();
-
-                    if handle.claim_interface(interface).is_err() {
-                        println!("Failed to claim interface");
+                    if let Err(e) = handle.claim_interface(interface) {
+                        drop(handle);
+                        println!("Failed to claim interface - {:?}", e);
                         thread::sleep(Duration::from_micros(options.delay));
                         continue;
+                    } else if options.verbose {
+                        println!("Initialised device correctly");
                     }
 
-                    let desc = device.device_descriptor().unwrap();
-                    match found_device {
-                        None => drop(device),
-                        Some((_, ref fd, _, _)) => {
-                            if options.verbose {
-                                println!(
-                                    "Found serial number {:?}",
-                                    desc.serial_number_string_index()
-                                );
-                            }
+                    let desc = device.device_descriptor().expect("No device descriptor!");
 
+                    if options.verbose {
+                        println!(
+                            "Found serial number {:?}",
+                            desc.serial_number_string_index()
+                        );
+                    }
+
+                    match found_device {
+                        None => {
+                            found_device = Some((handle, device, out_ep, in_ep));
+                            break;
+                        }
+                        Some((_, ref fd, _, _)) => {
                             if desc.serial_number_string_index()
                                 == fd.device_descriptor().unwrap().serial_number_string_index()
                             {
-                                drop(device);
+                                handle.release_interface(interface).unwrap();
+                                drop(handle);
+                                thread::sleep(Duration::from_micros(200));
+                                continue;
                             } else {
                                 found_device = Some((handle, device, out_ep, in_ep));
                                 break;
@@ -193,20 +372,21 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
             }
         }
 
-        if let Some((ref dev_handle, ref device, out_ep, in_ep)) = found_device {
+        if let Some((ref dev_handle, ref device, out_ep, _in_ep)) = found_device {
             let desc = device.device_descriptor().unwrap();
-            if desc.serial_number_string_index() == Some(0)
+            if desc.serial_number_string_index() == None
                 || desc.serial_number_string_index() == Some(3)
             {
                 println!("Sending bootcode.bin");
                 second_stage_boot(dev_handle, &options, out_ep, second_stage)?;
             } else {
                 println!("Second stage boot server");
-                file_server(dev_handle);
+                file_server(dev_handle, out_ep, start, &options)?;
             }
+
             thread::sleep(Duration::from_secs(1));
 
-            if desc.serial_number_string_index() != Some(0) && !options.loop_forever {
+            if desc.serial_number_string_index() != None && !options.loop_forever {
                 break;
             }
         }
