@@ -4,6 +4,10 @@ description = "Port of the raspberry pi usbboot code to rust"
 version = "0.1.0"
 authors = ["Mathias Koch <mk@blackbird.online>"]
 edition = "2018"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MathiasKoch/rustpiboot"
+readme = "README.md"
+keywords = ["raspberrypi", "boot"]
 
 [dependencies]
 libusb = "0.3.0"
