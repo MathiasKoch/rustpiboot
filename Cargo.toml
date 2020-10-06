@@ -12,4 +12,4 @@ keywords = ["raspberrypi", "boot"]
 [dependencies]
 libusb = "0.3.0"
 dd-lib = "0.2.1"
-log = "*"
+log = "^0.4"
