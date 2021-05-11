@@ -1,9 +1,7 @@
 //! Boot raspberry pi devices into mass storage mode
 
 use core::time::Duration;
-use libusb::{
-    request_type, Context, Device, DeviceHandle, Direction, Error, Recipient, RequestType,
-};
+use rusb::{Context, Device, DeviceHandle, Direction, Error, Recipient, RequestType, UsbContext, request_type};
 use std::convert::TryInto;
 use std::thread;
 
@@ -51,10 +49,10 @@ impl std::convert::TryFrom<u32> for Command {
 
 const LIBUSB_MAX_TRANSFER: usize = 16 * 1024;
 
-fn get_device<'a>(
-    usb_ctx: &'a Context,
+fn get_device<T: UsbContext>(
+    usb_ctx: &T,
     pid: u16,
-) -> Result<(Device<'a>, DeviceHandle<'a>), RpiError> {
+) -> Result<(Device<T>, DeviceHandle<T>), RpiError> {
     if let Ok(devices) = usb_ctx.devices() {
         match devices.iter().enumerate().find(|(i, dev)| {
             if let Ok(desc) = dev.device_descriptor() {
@@ -103,7 +101,7 @@ fn get_device<'a>(
     }
 }
 
-fn ep_write(dev_handle: &DeviceHandle, endpoint: u8, buf: &[u8]) -> Result<usize, RpiError> {
+fn ep_write<T: UsbContext>(dev_handle: &DeviceHandle<T>, endpoint: u8, buf: &[u8]) -> Result<usize, RpiError> {
     dev_handle
         .write_control(
             request_type(Direction::Out, RequestType::Vendor, Recipient::Device),
@@ -127,7 +125,7 @@ fn ep_write(dev_handle: &DeviceHandle, endpoint: u8, buf: &[u8]) -> Result<usize
     Ok(sent)
 }
 
-fn ep_read(dev_handle: &DeviceHandle, buf: &mut [u8]) -> Result<usize, RpiError> {
+fn ep_read<T: UsbContext>(dev_handle: &DeviceHandle<T>, buf: &mut [u8]) -> Result<usize, RpiError> {
     dev_handle
         .read_control(
             request_type(Direction::In, RequestType::Vendor, Recipient::Device),
@@ -146,8 +144,8 @@ fn ep_read(dev_handle: &DeviceHandle, buf: &mut [u8]) -> Result<usize, RpiError>
         })
 }
 
-fn second_stage_boot(
-    dev_handle: &DeviceHandle,
+fn second_stage_boot<T: UsbContext>(
+    dev_handle: &DeviceHandle<T>,
     out_ep: u8,
     boot_message: &[u8],
 ) -> Result<u32, RpiError> {
@@ -177,8 +175,8 @@ fn second_stage_boot(
     Ok(retcode)
 }
 
-fn file_server(
-    dev_handle: &DeviceHandle,
+fn file_server<T: UsbContext>(
+    dev_handle: &DeviceHandle<T>,
     out_ep: u8,
     start_message: &[u8],
 ) -> Result<(), RpiError> {
@@ -290,7 +288,7 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
     // };
 
     let usb_ctx = Context::new().expect("Failed to create usb context");
-    let mut found_device: Option<(DeviceHandle, Device, u8, u8)> = None;
+    let mut found_device: Option<(DeviceHandle<Context>, Device<Context>, u8, u8)> = None;
 
     loop {
         log::debug!("Waiting for BCM2835/6/7/2711...");
