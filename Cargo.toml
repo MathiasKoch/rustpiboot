@@ -13,3 +13,4 @@ keywords = ["raspberrypi", "boot"]
 rusb = "0.6.5"
 dd-lib = "0.2.1"
 log = "^0.4"
+simple_logger = "1.13.0"
