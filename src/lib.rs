@@ -38,12 +38,19 @@ impl std::convert::TryFrom<u32> for Command {
     }
 }
 
+const BOOTCODE_BIN: &[u8] = include_bytes!("msd/bootcode.bin");
+const BOOTCODE4_BIN: &[u8] = include_bytes!("msd/bootcode4.bin");
+const START_ELF: &[u8] = include_bytes!("msd/start.elf");
+const START4_ELF: &[u8] = include_bytes!("msd/start4.elf");
+
 const LIBUSB_MAX_TRANSFER: usize = 16 * 1024;
 
 fn get_device<T: UsbContext>(
     usb_ctx: &T,
     pid: u16,
-) -> Result<(Device<T>, DeviceHandle<T>), RpiError> {
+) -> Result<(Device<T>, DeviceHandle<T>, bool), RpiError> {
+    let mut is_bcm2711 = false;
+
     if let Ok(devices) = usb_ctx.devices() {
         match devices.iter().enumerate().find(|(i, dev)| {
             if let Ok(desc) = dev.device_descriptor() {
@@ -59,6 +66,7 @@ fn get_device<T: UsbContext>(
                     if prod_id == 0x2763 || prod_id == 0x2764 || prod_id == 0x2711 {
                         log::trace!("Found candidate Compute Module... ");
                         log::trace!("Device located successfully");
+                        is_bcm2711 = prod_id == 0x2711;
                         return true;
                     }
                 }
@@ -68,7 +76,7 @@ fn get_device<T: UsbContext>(
             Some((_, device)) => {
                 thread::sleep(Duration::from_secs(1));
                 match device.open() {
-                    Ok(handle) => Ok((device, handle)),
+                    Ok(handle) => Ok((device, handle, is_bcm2711)),
                     Err(Error::Access) => {
                         log::debug!("Permission to access USB device denied. Make sure you are a member of the plugdev group.");
                         std::process::exit(1);
@@ -198,7 +206,10 @@ fn file_server<T: UsbContext>(
 
         match command {
             Command::GetFileSize => {
-                if fname == "start.elf" {
+                // TODO: this is a dirty hack that works only because bootcode.bin and bootcode4.bin
+                // (sent in second_stage_boot) request start.elf and start4.elf respectively.
+                // Ideally, there should be a more robust filename lookup.
+                if fname == "start.elf" || fname == "start4.elf" {
                     dev_handle
                         .write_control(
                             request_type(Direction::Out, RequestType::Vendor, Recipient::Device),
@@ -254,9 +265,6 @@ impl Default for Options {
 }
 
 pub fn boot(options: Options) -> Result<(), RpiError> {
-    let second_stage = include_bytes!("bootcode.bin");
-    let start = include_bytes!("start.elf");
-
     // let signed_boot = if options.signed {
     //   Some(include_bytes!("bootsig.bin"))
     // } else {
@@ -265,6 +273,8 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
 
     let usb_ctx = Context::new().expect("Failed to create usb context");
     let mut found_device: Option<(DeviceHandle<Context>, Device<Context>, u8, u8)> = None;
+    let mut second_stage = BOOTCODE_BIN;
+    let mut start = START_ELF;
 
     loop {
         log::debug!("Waiting for BCM2835/6/7/2711...");
@@ -276,7 +286,7 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
                     thread::sleep(Duration::from_micros(200));
                     continue;
                 }
-                Ok((device, mut handle)) => {
+                Ok((device, mut handle, is_bcm2711)) => {
                     let config = device
                         .active_config_descriptor()
                         .expect("Failed to read config descriptor");
@@ -285,6 +295,11 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
                     } else {
                         (1, 3, 4)
                     };
+
+                    if is_bcm2711 {
+                        second_stage = BOOTCODE4_BIN;
+                        start = START4_ELF;
+                    }
 
                     if let Err(e) = handle.claim_interface(interface) {
                         drop(handle);
