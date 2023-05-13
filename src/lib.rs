@@ -1,19 +1,15 @@
 //! Boot raspberry pi devices into mass storage mode
 
 use core::time::Duration;
-use rusb::{Context, Device, DeviceHandle, Direction, Error, Recipient, RequestType, UsbContext, request_type};
+use rusb::{
+    request_type, Context, Device, DeviceHandle, Direction, Error, Recipient, RequestType,
+    UsbContext,
+};
 use std::convert::TryInto;
 use std::thread;
 
-#[allow(dead_code)]
 #[derive(Debug)]
-pub struct RpiError {
-    kind: Kind,
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub enum Kind {
+pub enum RpiError {
     FailedOpenDevice,
     DeviceNotFound,
     WriteError,
@@ -22,7 +18,6 @@ pub enum Kind {
     IoError,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum Command {
     GetFileSize = 0,
@@ -38,11 +33,7 @@ impl std::convert::TryFrom<u32> for Command {
             0 => Command::GetFileSize,
             1 => Command::ReadFile,
             2 => Command::Done,
-            _ => {
-                return Err(RpiError {
-                    kind: Kind::UnknownMessage,
-                })
-            }
+            _ => return Err(RpiError::UnknownMessage),
         })
     }
 }
@@ -84,24 +75,22 @@ fn get_device<T: UsbContext>(
                     }
                     Err(e) => {
                         log::trace!("Failed to open the requested device - {:?}", e);
-                        Err(RpiError {
-                            kind: Kind::FailedOpenDevice,
-                        })
+                        Err(RpiError::FailedOpenDevice)
                     }
                 }
             }
-            None => Err(RpiError {
-                kind: Kind::DeviceNotFound,
-            }),
+            None => Err(RpiError::DeviceNotFound),
         }
     } else {
-        Err(RpiError {
-            kind: Kind::DeviceNotFound,
-        })
+        Err(RpiError::DeviceNotFound)
     }
 }
 
-fn ep_write<T: UsbContext>(dev_handle: &DeviceHandle<T>, endpoint: u8, buf: &[u8]) -> Result<usize, RpiError> {
+fn ep_write<T: UsbContext>(
+    dev_handle: &DeviceHandle<T>,
+    endpoint: u8,
+    buf: &[u8],
+) -> Result<usize, RpiError> {
     dev_handle
         .write_control(
             request_type(Direction::Out, RequestType::Vendor, Recipient::Device),
@@ -117,9 +106,7 @@ fn ep_write<T: UsbContext>(dev_handle: &DeviceHandle<T>, endpoint: u8, buf: &[u8
     for chunk in buf.chunks(LIBUSB_MAX_TRANSFER) {
         sent += dev_handle
             .write_bulk(endpoint, chunk, Duration::from_secs(1))
-            .map_err(|_| RpiError {
-                kind: Kind::WriteError,
-            })?;
+            .map_err(|_| RpiError::WriteError)?;
     }
     log::trace!("write_bulk sent: {:?} bytes", sent);
     Ok(sent)
@@ -135,12 +122,10 @@ fn ep_read<T: UsbContext>(dev_handle: &DeviceHandle<T>, buf: &mut [u8]) -> Resul
             buf,
             Duration::from_secs(1),
         )
-        .map_err(|e| RpiError {
-            kind: match e {
-                Error::NoDevice => Kind::DeviceNotFound,
-                Error::Io => Kind::IoError,
-                _ => Kind::ReadError,
-            },
+        .map_err(|e| match e {
+            Error::NoDevice => RpiError::DeviceNotFound,
+            Error::Io => RpiError::IoError,
+            _ => RpiError::ReadError,
         })
 }
 
@@ -156,9 +141,7 @@ fn second_stage_boot<T: UsbContext>(
     let size = ep_write(dev_handle, out_ep, boot_message)?;
     if size != boot_message.len() {
         log::debug!("Failed to write correct length, returned {}", size);
-        return Err(RpiError {
-            kind: Kind::WriteError,
-        });
+        return Err(RpiError::WriteError);
     };
 
     thread::sleep(Duration::from_secs(1));
@@ -185,12 +168,7 @@ fn file_server<T: UsbContext>(
         if let Err(e) = ep_read(dev_handle, message) {
             // Drop out if the device goes away
             match e {
-                RpiError {
-                    kind: Kind::DeviceNotFound,
-                }
-                | RpiError {
-                    kind: Kind::IoError,
-                } => {
+                RpiError::DeviceNotFound | RpiError::IoError => {
                     break;
                 }
                 _ => {
@@ -241,9 +219,7 @@ fn file_server<T: UsbContext>(
                 let size = ep_write(dev_handle, out_ep, start_message)?;
                 if size != start_message.len() {
                     log::debug!("Failed to write complete file to USB device");
-                    return Err(RpiError {
-                        kind: Kind::WriteError,
-                    });
+                    return Err(RpiError::WriteError);
                 }
             }
             Command::Done => {
