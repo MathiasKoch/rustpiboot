@@ -244,10 +244,10 @@ fn file_server<T: UsbContext>(
 
 pub struct Options {
     // directory: Option<String>,
-    overlay: bool,
+    // overlay: bool,
     delay: u64,
     // signed: bool,
-    port: Option<u8>,
+    // port: Option<u8>,
     loop_forever: bool,
 }
 
@@ -255,10 +255,10 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             // directory: None,
-            overlay: false,
+            // overlay: false,
             delay: 500,
             // signed: false,
-            port: None,
+            // port: None,
             loop_forever: false,
         }
     }
