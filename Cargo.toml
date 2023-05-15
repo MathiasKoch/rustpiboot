@@ -11,5 +11,4 @@ keywords = ["raspberrypi", "boot"]
 
 [dependencies]
 rusb = "0.6.5"
-dd-lib = "0.2.1"
 log = "^0.4"
