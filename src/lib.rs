@@ -25,6 +25,12 @@ pub enum Command {
     Done = 2,
 }
 
+#[repr(C, packed)]
+struct BootMessage {
+    length: u32,
+    signature: [u8; 20],
+}
+
 impl std::convert::TryFrom<u32> for Command {
     type Error = RpiError;
 
@@ -47,7 +53,7 @@ const LIBUSB_MAX_TRANSFER: usize = 16 * 1024;
 
 fn get_device<T: UsbContext>(
     usb_ctx: &T,
-    pid: u16,
+    vendor_id: u16,
 ) -> Result<(Device<T>, DeviceHandle<T>, bool), RpiError> {
     let mut is_bcm2711 = false;
 
@@ -61,7 +67,7 @@ fn get_device<T: UsbContext>(
                     desc.product_id()
                 );
                 log::trace!("Bus: {:?}, Device: {:?}", dev.bus_number(), dev.address());
-                if desc.vendor_id() == pid {
+                if desc.vendor_id() == vendor_id {
                     let prod_id = desc.product_id();
                     if prod_id == 0x2763 || prod_id == 0x2764 || prod_id == 0x2711 {
                         log::trace!("Found candidate Compute Module... ");
@@ -116,7 +122,9 @@ fn ep_write<T: UsbContext>(
             .write_bulk(endpoint, chunk, Duration::from_secs(1))
             .map_err(|_| RpiError::WriteError)?;
     }
+
     log::trace!("write_bulk sent: {:?} bytes", sent);
+
     Ok(sent)
 }
 
@@ -128,7 +136,7 @@ fn ep_read<T: UsbContext>(dev_handle: &DeviceHandle<T>, buf: &mut [u8]) -> Resul
             (buf.len() & 0xffff).try_into().unwrap(),
             (buf.len() >> 16).try_into().unwrap(),
             buf,
-            Duration::from_secs(1),
+            Duration::from_secs(3),
         )
         .map_err(|e| match e {
             Error::NoDevice => RpiError::DeviceNotFound,
@@ -140,23 +148,33 @@ fn ep_read<T: UsbContext>(dev_handle: &DeviceHandle<T>, buf: &mut [u8]) -> Resul
 fn second_stage_boot<T: UsbContext>(
     dev_handle: &DeviceHandle<T>,
     out_ep: u8,
-    boot_message: &[u8],
+    second_stage: &[u8],
 ) -> Result<u32, RpiError> {
-    ep_write(dev_handle, out_ep, &boot_message[0..24])?;
+    let boot_message = BootMessage {
+        length: second_stage.len().try_into().unwrap(),
+        signature: [0; 20],
+    };
 
-    log::trace!("Writing {} bytes", boot_message.len());
+    // TODO: this is an ugly way to serialize
+    let mut boot_message_buf = [0; 24];
+    boot_message_buf[0..4].copy_from_slice(&boot_message.length.to_ne_bytes());
 
-    let size = ep_write(dev_handle, out_ep, boot_message)?;
-    if size != boot_message.len() {
+    ep_write(dev_handle, out_ep, &boot_message_buf)?;
+
+    log::trace!("Writing {} bytes", second_stage.len());
+
+    let size = ep_write(dev_handle, out_ep, second_stage)?;
+    if size != second_stage.len() {
         log::debug!("Failed to write correct length, returned {}", size);
         return Err(RpiError::WriteError);
     };
 
     thread::sleep(Duration::from_secs(1));
 
-    let buf = &mut [0; 4];
-    let size = ep_read(dev_handle, buf)?;
-    let retcode = u32::from_le_bytes(*buf);
+    let mut buf = [0; 4];
+    let size = ep_read(dev_handle, &mut buf)?;
+    let retcode = u32::from_le_bytes(buf);
+
     if size > 0 && retcode == 0 {
         log::debug!("Successful read {:?} bytes", size);
     } else {
@@ -290,6 +308,9 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
                     let config = device
                         .active_config_descriptor()
                         .expect("Failed to read config descriptor");
+
+                    // Handle 2837 where it can start with two interfaces, the first is mass storage
+                    // the second is the vendor interface for programming
                     let (interface, out_ep, in_ep) = if config.num_interfaces() == 1 {
                         (0, 1, 2)
                     } else {
@@ -307,6 +328,7 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
                         thread::sleep(Duration::from_micros(options.delay));
                         continue;
                     }
+
                     log::trace!("Initialised device correctly");
 
                     let desc = device.device_descriptor().expect("No device descriptor!");
