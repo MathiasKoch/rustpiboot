@@ -375,7 +375,11 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
 
             thread::sleep(Duration::from_secs(1));
 
-            if desc.serial_number_string_index() != None && !options.loop_forever {
+            let cont = options.loop_forever
+                || desc.serial_number_string_index().is_none()
+                || desc.serial_number_string_index() == Some(3);
+
+            if !cont {
                 break;
             }
         }
