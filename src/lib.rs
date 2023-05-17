@@ -61,12 +61,12 @@ fn get_device<T: UsbContext>(
         match devices.iter().enumerate().find(|(i, dev)| {
             if let Ok(desc) = dev.device_descriptor() {
                 log::trace!(
-                    "Found device {:?} idVendor=0x{:x?} idProduct=0x{:0x?}",
+                    "Found device {} idVendor={:#x} idProduct={:#06x}",
                     i + 1,
                     desc.vendor_id(),
                     desc.product_id()
                 );
-                log::trace!("Bus: {:?}, Device: {:?}", dev.bus_number(), dev.address());
+                log::trace!("Bus: {}, Device: {}", dev.bus_number(), dev.address());
                 if desc.vendor_id() == vendor_id {
                     let prod_id = desc.product_id();
                     if prod_id == 0x2763 || prod_id == 0x2764 || prod_id == 0x2711 {
@@ -123,7 +123,7 @@ fn ep_write<T: UsbContext>(
             .map_err(|_| RpiError::WriteError)?;
     }
 
-    log::trace!("write_bulk sent: {:?} bytes", sent);
+    log::trace!("write_bulk sent: {} bytes", sent);
 
     Ok(sent)
 }
@@ -176,9 +176,9 @@ fn second_stage_boot<T: UsbContext>(
     let retcode = u32::from_le_bytes(buf);
 
     if size > 0 && retcode == 0 {
-        log::debug!("Successful read {:?} bytes", size);
+        log::debug!("Successful read {} bytes", size);
     } else {
-        log::debug!("Failed : 0x{:x?}", retcode);
+        log::debug!("Failed : {:#x}", retcode);
     }
 
     Ok(retcode)
@@ -260,6 +260,7 @@ fn file_server<T: UsbContext>(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 pub struct Options {
     // directory: Option<String>,
     // overlay: bool,
@@ -351,10 +352,10 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
                                 drop(handle);
                                 thread::sleep(Duration::from_micros(200));
                                 continue;
-                            } else {
-                                found_device = Some((handle, device, out_ep, in_ep));
-                                break;
                             }
+
+                            found_device = Some((handle, device, out_ep, in_ep));
+                            break;
                         }
                     }
                 }
@@ -363,7 +364,7 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
 
         if let Some((ref dev_handle, ref device, out_ep, _in_ep)) = found_device {
             let desc = device.device_descriptor().unwrap();
-            if desc.serial_number_string_index() == None
+            if desc.serial_number_string_index().is_none()
                 || desc.serial_number_string_index() == Some(3)
             {
                 log::debug!("Sending bootcode.bin");
