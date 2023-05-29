@@ -264,10 +264,10 @@ fn file_server<T: UsbContext>(
 pub struct Options {
     // directory: Option<String>,
     // overlay: bool,
-    delay: u64,
+    pub delay: u64,
     // signed: bool,
     // port: Option<u8>,
-    loop_forever: bool,
+    pub loop_forever: bool,
 }
 
 impl Default for Options {
@@ -302,7 +302,7 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
         loop {
             match get_device(&usb_ctx, 0x0a5c) {
                 Err(_) => {
-                    thread::sleep(Duration::from_micros(200));
+                    thread::sleep(Duration::from_micros(options.delay + 200));
                     continue;
                 }
                 Ok((device, mut handle, is_bcm2711)) => {
