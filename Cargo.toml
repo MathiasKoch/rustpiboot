@@ -10,5 +10,5 @@ readme = "README.md"
 keywords = ["raspberrypi", "boot"]
 
 [dependencies]
-rusb = "0.6.5"
+rusb = "0.9.2"
 log = "^0.4"

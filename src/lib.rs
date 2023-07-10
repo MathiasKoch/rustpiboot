@@ -61,7 +61,7 @@ fn get_device<T: UsbContext>(
         match devices.iter().enumerate().find(|(i, dev)| {
             if let Ok(desc) = dev.device_descriptor() {
                 log::trace!(
-                    "Found device {} idVendor={:#x} idProduct={:#06x}",
+                    "Found device {} idVendor={:#06x} idProduct={:#06x}",
                     i + 1,
                     desc.vendor_id(),
                     desc.product_id()
