@@ -1,19 +1,15 @@
 //! Boot raspberry pi devices into mass storage mode
 
 use core::time::Duration;
-use rusb::{Context, Device, DeviceHandle, Direction, Error, Recipient, RequestType, UsbContext, request_type};
+use rusb::{
+    request_type, Context, Device, DeviceHandle, Direction, Error, Recipient, RequestType,
+    UsbContext,
+};
 use std::convert::TryInto;
 use std::thread;
 
-#[allow(dead_code)]
 #[derive(Debug)]
-pub struct RpiError {
-    kind: Kind,
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub enum Kind {
+pub enum RpiError {
     FailedOpenDevice,
     DeviceNotFound,
     WriteError,
@@ -22,12 +18,17 @@ pub enum Kind {
     IoError,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum Command {
     GetFileSize = 0,
     ReadFile = 1,
     Done = 2,
+}
+
+#[repr(C, packed)]
+struct BootMessage {
+    length: u32,
+    signature: [u8; 20],
 }
 
 impl std::convert::TryFrom<u32> for Command {
@@ -38,36 +39,40 @@ impl std::convert::TryFrom<u32> for Command {
             0 => Command::GetFileSize,
             1 => Command::ReadFile,
             2 => Command::Done,
-            _ => {
-                return Err(RpiError {
-                    kind: Kind::UnknownMessage,
-                })
-            }
+            _ => return Err(RpiError::UnknownMessage),
         })
     }
 }
+
+const BOOTCODE_BIN: &[u8] = include_bytes!("msd/bootcode.bin");
+const BOOTCODE4_BIN: &[u8] = include_bytes!("msd/bootcode4.bin");
+const START_ELF: &[u8] = include_bytes!("msd/start.elf");
+const START4_ELF: &[u8] = include_bytes!("msd/start4.elf");
 
 const LIBUSB_MAX_TRANSFER: usize = 16 * 1024;
 
 fn get_device<T: UsbContext>(
     usb_ctx: &T,
-    pid: u16,
-) -> Result<(Device<T>, DeviceHandle<T>), RpiError> {
+    vendor_id: u16,
+) -> Result<(Device<T>, DeviceHandle<T>, bool), RpiError> {
+    let mut is_bcm2711 = false;
+
     if let Ok(devices) = usb_ctx.devices() {
         match devices.iter().enumerate().find(|(i, dev)| {
             if let Ok(desc) = dev.device_descriptor() {
                 log::trace!(
-                    "Found device {:?} idVendor=0x{:x?} idProduct=0x{:0x?}",
+                    "Found device {} idVendor={:#06x} idProduct={:#06x}",
                     i + 1,
                     desc.vendor_id(),
                     desc.product_id()
                 );
-                log::trace!("Bus: {:?}, Device: {:?}", dev.bus_number(), dev.address());
-                if desc.vendor_id() == pid {
+                log::trace!("Bus: {}, Device: {}", dev.bus_number(), dev.address());
+                if desc.vendor_id() == vendor_id {
                     let prod_id = desc.product_id();
                     if prod_id == 0x2763 || prod_id == 0x2764 || prod_id == 0x2711 {
                         log::trace!("Found candidate Compute Module... ");
                         log::trace!("Device located successfully");
+                        is_bcm2711 = prod_id == 0x2711;
                         return true;
                     }
                 }
@@ -77,31 +82,29 @@ fn get_device<T: UsbContext>(
             Some((_, device)) => {
                 thread::sleep(Duration::from_secs(1));
                 match device.open() {
-                    Ok(handle) => Ok((device, handle)),
+                    Ok(handle) => Ok((device, handle, is_bcm2711)),
                     Err(Error::Access) => {
                         log::debug!("Permission to access USB device denied. Make sure you are a member of the plugdev group.");
                         std::process::exit(1);
                     }
                     Err(e) => {
                         log::trace!("Failed to open the requested device - {:?}", e);
-                        Err(RpiError {
-                            kind: Kind::FailedOpenDevice,
-                        })
+                        Err(RpiError::FailedOpenDevice)
                     }
                 }
             }
-            None => Err(RpiError {
-                kind: Kind::DeviceNotFound,
-            }),
+            None => Err(RpiError::DeviceNotFound),
         }
     } else {
-        Err(RpiError {
-            kind: Kind::DeviceNotFound,
-        })
+        Err(RpiError::DeviceNotFound)
     }
 }
 
-fn ep_write<T: UsbContext>(dev_handle: &DeviceHandle<T>, endpoint: u8, buf: &[u8]) -> Result<usize, RpiError> {
+fn ep_write<T: UsbContext>(
+    dev_handle: &DeviceHandle<T>,
+    endpoint: u8,
+    buf: &[u8],
+) -> Result<usize, RpiError> {
     dev_handle
         .write_control(
             request_type(Direction::Out, RequestType::Vendor, Recipient::Device),
@@ -117,11 +120,11 @@ fn ep_write<T: UsbContext>(dev_handle: &DeviceHandle<T>, endpoint: u8, buf: &[u8
     for chunk in buf.chunks(LIBUSB_MAX_TRANSFER) {
         sent += dev_handle
             .write_bulk(endpoint, chunk, Duration::from_secs(1))
-            .map_err(|_| RpiError {
-                kind: Kind::WriteError,
-            })?;
+            .map_err(|_| RpiError::WriteError)?;
     }
-    log::trace!("write_bulk sent: {:?} bytes", sent);
+
+    log::trace!("write_bulk sent: {} bytes", sent);
+
     Ok(sent)
 }
 
@@ -133,43 +136,49 @@ fn ep_read<T: UsbContext>(dev_handle: &DeviceHandle<T>, buf: &mut [u8]) -> Resul
             (buf.len() & 0xffff).try_into().unwrap(),
             (buf.len() >> 16).try_into().unwrap(),
             buf,
-            Duration::from_secs(1),
+            Duration::from_secs(3),
         )
-        .map_err(|e| RpiError {
-            kind: match e {
-                Error::NoDevice => Kind::DeviceNotFound,
-                Error::Io => Kind::IoError,
-                _ => Kind::ReadError,
-            },
+        .map_err(|e| match e {
+            Error::NoDevice => RpiError::DeviceNotFound,
+            Error::Io => RpiError::IoError,
+            _ => RpiError::ReadError,
         })
 }
 
 fn second_stage_boot<T: UsbContext>(
     dev_handle: &DeviceHandle<T>,
     out_ep: u8,
-    boot_message: &[u8],
+    second_stage: &[u8],
 ) -> Result<u32, RpiError> {
-    ep_write(dev_handle, out_ep, &boot_message[0..24])?;
+    let boot_message = BootMessage {
+        length: second_stage.len().try_into().unwrap(),
+        signature: [0; 20],
+    };
 
-    log::trace!("Writing {} bytes", boot_message.len());
+    // TODO: this is an ugly way to serialize
+    let mut boot_message_buf = [0; 24];
+    boot_message_buf[0..4].copy_from_slice(&boot_message.length.to_ne_bytes());
 
-    let size = ep_write(dev_handle, out_ep, boot_message)?;
-    if size != boot_message.len() {
+    ep_write(dev_handle, out_ep, &boot_message_buf)?;
+
+    log::trace!("Writing {} bytes", second_stage.len());
+
+    let size = ep_write(dev_handle, out_ep, second_stage)?;
+    if size != second_stage.len() {
         log::debug!("Failed to write correct length, returned {}", size);
-        return Err(RpiError {
-            kind: Kind::WriteError,
-        });
+        return Err(RpiError::WriteError);
     };
 
     thread::sleep(Duration::from_secs(1));
 
-    let buf = &mut [0; 4];
-    let size = ep_read(dev_handle, buf)?;
-    let retcode = u32::from_le_bytes(*buf);
+    let mut buf = [0; 4];
+    let size = ep_read(dev_handle, &mut buf)?;
+    let retcode = u32::from_le_bytes(buf);
+
     if size > 0 && retcode == 0 {
-        log::debug!("Successful read {:?} bytes", size);
+        log::debug!("Successful read {} bytes", size);
     } else {
-        log::debug!("Failed : 0x{:x?}", retcode);
+        log::debug!("Failed : {:#x}", retcode);
     }
 
     Ok(retcode)
@@ -185,12 +194,7 @@ fn file_server<T: UsbContext>(
         if let Err(e) = ep_read(dev_handle, message) {
             // Drop out if the device goes away
             match e {
-                RpiError {
-                    kind: Kind::DeviceNotFound,
-                }
-                | RpiError {
-                    kind: Kind::IoError,
-                } => {
+                RpiError::DeviceNotFound | RpiError::IoError => {
                     break;
                 }
                 _ => {
@@ -220,7 +224,10 @@ fn file_server<T: UsbContext>(
 
         match command {
             Command::GetFileSize => {
-                if fname == "start.elf" {
+                // TODO: this is a dirty hack that works only because bootcode.bin and bootcode4.bin
+                // (sent in second_stage_boot) request start.elf and start4.elf respectively.
+                // Ideally, there should be a more robust filename lookup.
+                if fname == "start.elf" || fname == "start4.elf" {
                     dev_handle
                         .write_control(
                             request_type(Direction::Out, RequestType::Vendor, Recipient::Device),
@@ -241,9 +248,7 @@ fn file_server<T: UsbContext>(
                 let size = ep_write(dev_handle, out_ep, start_message)?;
                 if size != start_message.len() {
                     log::debug!("Failed to write complete file to USB device");
-                    return Err(RpiError {
-                        kind: Kind::WriteError,
-                    });
+                    return Err(RpiError::WriteError);
                 }
             }
             Command::Done => {
@@ -255,32 +260,30 @@ fn file_server<T: UsbContext>(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 pub struct Options {
     // directory: Option<String>,
-    overlay: bool,
-    delay: u64,
+    // overlay: bool,
+    pub delay: u64,
     // signed: bool,
-    port: Option<u8>,
-    loop_forever: bool,
+    // port: Option<u8>,
+    pub loop_forever: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options {
             // directory: None,
-            overlay: false,
+            // overlay: false,
             delay: 500,
             // signed: false,
-            port: None,
+            // port: None,
             loop_forever: false,
         }
     }
 }
 
 pub fn boot(options: Options) -> Result<(), RpiError> {
-    let second_stage = include_bytes!("bootcode.bin");
-    let start = include_bytes!("start.elf");
-
     // let signed_boot = if options.signed {
     //   Some(include_bytes!("bootsig.bin"))
     // } else {
@@ -289,6 +292,8 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
 
     let usb_ctx = Context::new().expect("Failed to create usb context");
     let mut found_device: Option<(DeviceHandle<Context>, Device<Context>, u8, u8)> = None;
+    let mut second_stage = BOOTCODE_BIN;
+    let mut start = START_ELF;
 
     loop {
         log::debug!("Waiting for BCM2835/6/7/2711...");
@@ -297,18 +302,26 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
         loop {
             match get_device(&usb_ctx, 0x0a5c) {
                 Err(_) => {
-                    thread::sleep(Duration::from_micros(200));
+                    thread::sleep(Duration::from_micros(options.delay + 200));
                     continue;
                 }
-                Ok((device, mut handle)) => {
+                Ok((device, mut handle, is_bcm2711)) => {
                     let config = device
                         .active_config_descriptor()
                         .expect("Failed to read config descriptor");
+
+                    // Handle 2837 where it can start with two interfaces, the first is mass storage
+                    // the second is the vendor interface for programming
                     let (interface, out_ep, in_ep) = if config.num_interfaces() == 1 {
                         (0, 1, 2)
                     } else {
                         (1, 3, 4)
                     };
+
+                    if is_bcm2711 {
+                        second_stage = BOOTCODE4_BIN;
+                        start = START4_ELF;
+                    }
 
                     if let Err(e) = handle.claim_interface(interface) {
                         drop(handle);
@@ -316,6 +329,7 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
                         thread::sleep(Duration::from_micros(options.delay));
                         continue;
                     }
+
                     log::trace!("Initialised device correctly");
 
                     let desc = device.device_descriptor().expect("No device descriptor!");
@@ -338,10 +352,10 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
                                 drop(handle);
                                 thread::sleep(Duration::from_micros(200));
                                 continue;
-                            } else {
-                                found_device = Some((handle, device, out_ep, in_ep));
-                                break;
                             }
+
+                            found_device = Some((handle, device, out_ep, in_ep));
+                            break;
                         }
                     }
                 }
@@ -350,7 +364,7 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
 
         if let Some((ref dev_handle, ref device, out_ep, _in_ep)) = found_device {
             let desc = device.device_descriptor().unwrap();
-            if desc.serial_number_string_index() == None
+            if desc.serial_number_string_index().is_none()
                 || desc.serial_number_string_index() == Some(3)
             {
                 log::debug!("Sending bootcode.bin");
@@ -362,7 +376,11 @@ pub fn boot(options: Options) -> Result<(), RpiError> {
 
             thread::sleep(Duration::from_secs(1));
 
-            if desc.serial_number_string_index() != None && !options.loop_forever {
+            let cont = options.loop_forever
+                || desc.serial_number_string_index().is_none()
+                || desc.serial_number_string_index() == Some(3);
+
+            if !cont {
                 break;
             }
         }
